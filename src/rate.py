@@ -24,12 +24,13 @@ from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 
 ROOT = Path(__file__).resolve().parent.parent
-INPUT_PATH = ROOT / "outputs" / "manual_tasks_sample100.tsv"
+INPUT_PATH = Path(os.environ.get("RATE_INPUT", ROOT / "outputs" / "manual_tasks_sample100.tsv"))
 LOG_DIR = ROOT / "logs"
 
 MODEL = os.environ.get("RATE_MODEL", "claude-sonnet-4-6")
 _tag = MODEL.replace("claude-", "").replace("-", "_")
-OUTPUT_PATH = ROOT / "outputs" / f"manual_tasks_sample100_rated_{_tag}.tsv"
+_stem = INPUT_PATH.stem
+OUTPUT_PATH = Path(os.environ.get("RATE_OUTPUT", ROOT / "outputs" / f"{_stem}_rated_{_tag}.tsv"))
 CONCURRENCY = 200
 MAX_RETRIES = 5
 
@@ -132,9 +133,18 @@ async def rate_one(
                     tool_choice={"type": "tool", "name": "rate_task"},
                     messages=[{"role": "user", "content": task["task"]}],
                 )
+                required = ("task_category", "human_time_minutes", "human_time_rationale",
+                            "robot_success_prob", "robot_success_rationale")
                 for block in resp.content:
                     if block.type == "tool_use" and block.name == "rate_task":
                         r = block.input
+                        if not all(k in r for k in required):
+                            logging.warning("task_id=%s incomplete tool input attempt=%d raw=%s",
+                                            task["task_id"], attempt + 1, json.dumps(r))
+                            if attempt < MAX_RETRIES - 1:
+                                await asyncio.sleep(1 + attempt)
+                                break  # retry outer loop
+                            return None
                         logging.info("task_id=%s raw=%s", task["task_id"], json.dumps(r))
                         return {
                             "task_id": task["task_id"],
@@ -146,13 +156,16 @@ async def rate_one(
                             "robot_success_prob": float(r["robot_success_prob"]),
                             "robot_success_rationale": str(r["robot_success_rationale"]).replace("\t", " ").replace("\n", " "),
                         }
-                logging.warning("task_id=%s no tool_use in response", task["task_id"])
-                return None
+                else:
+                    logging.warning("task_id=%s no tool_use in response", task["task_id"])
+                    return None
+                continue  # retry after incomplete input
             except (RateLimitError, APIStatusError) as e:
                 status = getattr(e, "status_code", None)
                 if status in (429, 529, 500, 502, 503, 504) and attempt < MAX_RETRIES - 1:
-                    backoff = 2**attempt
-                    logging.warning("task_id=%s retry %d (status=%s)", task["task_id"], attempt + 1, status)
+                    backoff = min(2**attempt * 4, 60)  # 4,8,16,32,60s
+                    logging.warning("task_id=%s retry %d sleep=%ds (status=%s)",
+                                    task["task_id"], attempt + 1, backoff, status)
                     await asyncio.sleep(backoff)
                     continue
                 logging.error("task_id=%s permanent error: %s", task["task_id"], e)
@@ -173,22 +186,20 @@ async def main() -> None:
 
     with INPUT_PATH.open(encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
-        tasks = list(reader)
-    logging.info("input=%s rows=%d", INPUT_PATH, len(tasks))
+        all_tasks = list(reader)
 
-    client = AsyncAnthropic()
-    semaphore = asyncio.Semaphore(CONCURRENCY)
+    done: set[str] = set()
+    if OUTPUT_PATH.exists():
+        with OUTPUT_PATH.open(encoding="utf-8") as f:
+            for r in csv.DictReader(f, delimiter="\t"):
+                done.add(r["task_id"])
+    pending = [t for t in all_tasks if t["task_id"] not in done]
+    logging.info("input=%s total=%d done=%d pending=%d", INPUT_PATH, len(all_tasks), len(done), len(pending))
 
-    start = time.time()
-    coros = [rate_one(client, semaphore, t) for t in tasks]
-    results = await tqdm.gather(*coros, desc="rate", unit="task")
-    elapsed = time.time() - start
+    if not pending:
+        print(f"nothing to do; {OUTPUT_PATH.relative_to(ROOT)} already has all {len(done)} rows")
+        return
 
-    ok = [r for r in results if r is not None]
-    fail = len(results) - len(ok)
-    logging.info("done ok=%d fail=%d elapsed=%.1fs", len(ok), fail, elapsed)
-
-    ok.sort(key=lambda r: r["task_id"])
     fieldnames = [
         "task_id",
         "soc_code",
@@ -199,11 +210,39 @@ async def main() -> None:
         "robot_success_prob",
         "robot_success_rationale",
     ]
-    with OUTPUT_PATH.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not OUTPUT_PATH.exists()
+    out = OUTPUT_PATH.open("a", encoding="utf-8", newline="")
+    writer = csv.DictWriter(out, fieldnames=fieldnames, delimiter="\t")
+    if new_file:
         writer.writeheader()
-        writer.writerows(ok)
-    print(f"wrote {OUTPUT_PATH.relative_to(ROOT)} rows={len(ok)}")
+        out.flush()
+
+    client = AsyncAnthropic()
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    write_lock = asyncio.Lock()
+    ok = 0
+    fail = 0
+
+    async def worker(task: dict) -> None:
+        nonlocal ok, fail
+        result = await rate_one(client, semaphore, task)
+        if result is None:
+            fail += 1
+            return
+        async with write_lock:
+            writer.writerow(result)
+            out.flush()
+        ok += 1
+
+    start = time.time()
+    coros = [worker(t) for t in pending]
+    await tqdm.gather(*coros, desc="rate", unit="task")
+    elapsed = time.time() - start
+
+    out.close()
+    logging.info("done ok=%d fail=%d elapsed=%.1fs", ok, fail, elapsed)
+    print(f"wrote {OUTPUT_PATH.relative_to(ROOT)} new_rows={ok} fail={fail}")
 
 
 if __name__ == "__main__":
