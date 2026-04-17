@@ -68,6 +68,19 @@ def main() -> None:
 
     ax.legend(fontsize=12, loc="upper right", framealpha=0.9)
 
+    thresholds = [(1, "1 min"), (5, "5 min"), (10, "10 min"), (15, "15 min"),
+                  (20, "20 min"), (30, "30 min"), (45, "45 min"), (60, "1 hr")]
+    lines = ["Tasks taking less than:"]
+    for v, lab in thresholds:
+        c = int((t < v).sum())
+        lines.append(f"  {lab:>6}:  {c:>5,}  ({c / n * 100:>4.1f}%)")
+    ax.text(
+        0.015, 0.97, "\n".join(lines),
+        transform=ax.transAxes, ha="left", va="top",
+        fontsize=12, family="monospace",
+        bbox={"facecolor": "white", "edgecolor": "#888", "alpha": 0.92, "pad": 6},
+    )
+
     fig.tight_layout()
     fig.savefig(OUT_PATH, dpi=160, bbox_inches="tight")
     print(f"wrote {OUT_PATH.relative_to(ROOT)} rows={n}")
