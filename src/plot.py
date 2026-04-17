@@ -34,19 +34,24 @@ def main() -> None:
     cmap = plt.get_cmap("tab10")
     colors = {c: cmap(i) for i, c in enumerate(cats)}
 
+    rng = np.random.default_rng(42)
+    # Multiplicative jitter on log-x (±6% so round values like 1/5/15/30 min spread out)
+    df["x_j"] = df["human_time_minutes"] * rng.uniform(0.94, 1.06, size=len(df))
+    # Additive jitter on y (±1.5 pp so integer-valued probabilities separate visually)
+    df["y_j"] = df["robot_success_prob"] + rng.uniform(-1.5, 1.5, size=len(df))
+
     fig, ax = plt.subplots(figsize=(14, 9))
     for c in cats:
         sub = df[df["cat_plot"] == c]
         if sub.empty:
             continue
         ax.scatter(
-            sub["human_time_minutes"],
-            sub["robot_success_prob"],
-            s=28,
-            alpha=0.55,
+            sub["x_j"],
+            sub["y_j"],
+            s=18,
+            alpha=0.35,
             color=colors[c],
-            edgecolor="white",
-            linewidth=0.4,
+            edgecolor="none",
             label=f"{c} (n={len(sub)})",
         )
 
