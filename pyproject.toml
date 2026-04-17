@@ -1,0 +1,10 @@
+[project]
+name = "robotics-task-horizon"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.96.0",
+    "python-dotenv>=1.2.2",
+    "tqdm>=4.67.3",
+]
